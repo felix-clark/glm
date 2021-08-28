@@ -8,6 +8,7 @@ use crate::{
     link::{Link, Transform},
     model::Model,
     num::Float,
+    Linear,
 };
 use ndarray::{array, Array1, Array2, ArrayBase, ArrayView1, Data, Ix2};
 use ndarray_linalg::InverseHInto;
@@ -24,7 +25,7 @@ where
     data: &'a Model<M, F>,
     /// The parameter values that maximize the likelihood as given by the IRLS regression.
     pub result: Array1<F>,
-    /// The options used in the fit
+    /// The options used for this fit.
     pub options: FitOptions<F>,
     /// The value of the likelihood function for the fit result.
     pub model_like: F,
@@ -50,7 +51,7 @@ where
     F: 'static + Float,
     // F: std::fmt::Debug,
 {
-    pub fn new(
+    pub(crate) fn new(
         data: &'a Model<M, F>,
         result: Array1<F>,
         options: FitOptions<F>,
@@ -177,7 +178,7 @@ where
                     // likelihood contribution is the same for all observations.
                     let nat_par = M::Link::nat_param(array![intercept]);
                     // The null likelihood per observation
-                    let null_like_one: F = M::log_like_natural(&array![y_bar], &nat_par);
+                    let null_like_one: F = M::log_like_natural(y_bar, nat_par[0]);
                     // just multiply the average likelihood by the number of data points, since every term is the same.
                     let null_like_total = F::from(self.n_data).unwrap() * null_like_one;
                     let null_params: Array1<F> = {
@@ -229,7 +230,10 @@ where
                         // of the linear offset. The likelihood must still be summed
                         // over all observations, since they have different offsets.
                         let nat_par = M::Link::nat_param(off.clone());
-                        let null_like = M::log_like_natural(&self.data.y, &nat_par);
+                        let null_like = ndarray::Zip::from(&self.data.y)
+                            .and(&nat_par)
+                            .map_collect(|&y, &eta| M::log_like_natural(y, eta))
+                            .sum();
                         let null_params = Array1::<F>::zeros(self.n_par);
                         (null_like, null_params)
                     }
@@ -253,8 +257,8 @@ where
     }
 
     /// The covariance matrix estimated by the Fisher information and the
-    /// dispersion parameter. The value will be cached to avoid repeating the
-    /// potentially expensive matrix inversion, but this is not yet implemented.
+    /// dispersion parameter. The matrix is cached to avoid repeating the
+    /// potentially expensive matrix inversion.
     // TODO: This will also need to be fixed up for the weighted case.
     pub fn covariance(&self) -> RegressionResult<Array2<F>> {
         if self.cov.borrow().is_none() {
@@ -273,8 +277,7 @@ where
     /// Returns the deviance of the fit: twice the difference between the
     /// saturated likelihood and the model likelihood. Asymptotically this fits
     /// a chi-squared distribution with `self.ndf()` degrees of freedom.
-    // This could potentially return an array with the contribution to the
-    // deviance at every point.
+    /// Note that the regularized likelihood is used here.
     // TODO: This is likely sensitive to regularization because the saturated
     // model is not regularized but the model likelihood is. Perhaps this can be
     // accounted for with an effective number of degrees of freedom.
@@ -283,10 +286,19 @@ where
     pub fn deviance(&self) -> F {
         // Note that this must change if the GLM likelihood subtracts the
         // saturated one already.
-        F::from(2.).unwrap() * (M::log_like_sat(&self.data.y) - self.model_like)
+        F::from(2.).unwrap() * (self.data.y.mapv(M::log_like_sat).sum() - self.model_like)
     }
 
-    /// Estimate the dispersion parameter through the method of moments.
+    /// Estimate the dispersion parameter (typically denoted `phi`)  which relates the variance
+    /// of the `y` values with the variance of the response distribution: `Var[y] = phi *
+    /// Var[mu]`.
+    /// The method of moments is used to approximate phi, which is exact in the linear OLS case
+    /// but only an approximation in general.
+    /// Equal to the sum of `(y_i - mu_i)^2 / V(mu_i)` divided by the degrees of freedom (`n - p`).
+    /// For OLS linear regression, this provides an estimate of `sigma^2`; with no covariates
+    /// it is equal to the sample variance.
+    /// In logistic and Poisson regression `phi > 1` indicates overdispersion; that is, a larger
+    /// variance in the `y` data than is accouned for in the response distribution.
     // NOTE: This appears to be quite similar to the score test.
     // TODO: This will need to be fixed up for weighted regression, including
     // the weights in the covariance matrix.
@@ -300,7 +312,7 @@ where
 
     /// Returns the errors in the response variables for the data passed as an
     /// argument given the current model fit.
-    pub fn errors(&self, data: &Model<M, F>) -> Array1<F> {
+    fn errors(&self, data: &Model<M, F>) -> Array1<F> {
         &data.y - &self.expectation(&data.x, data.linear_offset.as_ref())
     }
 
@@ -319,6 +331,37 @@ where
         self.options.reg.as_ref().irls_mat(fisher, params)
     }
 
+    /// Returns the deviance residuals for each point in the training data.
+    /// Equal to `sign(y-E[y|x])*sqrt(-2*(L[y|x] - L_sat[y]))`.
+    /// This is usually a better choice for non-linear models.
+    /// NaNs might be possible if L[y|x] > L_sat[y] due to floating-point operations. These are
+    /// not checked or clipped right now.
+    pub fn residuals_deviance(&self) -> Array1<F> {
+        let signs = self.residuals_response().mapv_into(F::signum);
+        let ll_terms: Array1<F> = M::log_like_terms(&self.data, &self.result);
+        let ll_sat: Array1<F> = self.data.y.mapv(M::log_like_sat);
+        let neg_two = F::from(-2.).unwrap();
+        let dev: Array1<F> = (ll_terms - ll_sat).mapv_into(|l| num_traits::Float::sqrt(neg_two * l));
+        signs * dev
+    }
+
+    /// Returns the Pearson or standardized residuals for each point in the training data.
+    /// This is equal to `(y - E[y|x])/sqrt(Var[y|x])`, given the fitted model.
+    pub fn residuals_pearson(&self) -> Array1<F> {
+        let mu: Array1<F> = self.expectation(&self.data.x, self.data.linear_offset.as_ref());
+        let residuals = &self.data.y - &mu;
+        let var_diag: Array1<F> = mu.mapv_into(M::variance);
+        let std: Array1<F> = var_diag.mapv_into(num_traits::Float::sqrt);
+        residuals / std
+    }
+
+    /// Returns the raw residuals, or fitting deviation, for each data point in the fit; that is,
+    /// the difference y - E[y|x] where the expectation value is the y value predicted by the model
+    /// given x.
+    pub fn residuals_response(&self) -> Array1<F> {
+        self.errors(&self.data)
+    }
+
     /// Returns the score function (the gradient of the likelihood) at the
     /// parameter values given. It should be zero within FPE at the minimized
     /// result.
@@ -334,7 +377,7 @@ where
     }
 
     /// Returns the score test statistic. This statistic is asymptotically
-    /// chi-squared distributioned with `test_ndf()` degrees of freedom.
+    /// chi-squared distributed with `test_ndf()` degrees of freedom.
     pub fn score_test(&self) -> RegressionResult<F> {
         let (_, null_params) = self.null_model_fit();
         self.score_test_against(null_params)
@@ -391,8 +434,6 @@ where
         Ok(&self.result / &par_variances.mapv(num_traits::Float::sqrt))
     }
 
-    // TODO: score test using Fisher score and information matrix.
-
     /// Returns the Akaike information criterion for the model fit.
     // TODO: Should an effective number of parameters that takes regularization
     // into acount be considered?
@@ -413,11 +454,31 @@ where
     }
 }
 
+/// Specialized functions for OLS.
+impl<'a, F> Fit<'a, Linear, F>
+where
+    F: 'static + Float,
+{
+    /// Returns the coefficient of multiple correlation, R^2.
+    pub fn r_sq(&self) -> F {
+        let y_avg: F = self.data.y.mean().expect("Data should be non-empty");
+        let total_sum_sq: F = self.data.y.mapv(|y| y - y_avg).mapv(|dy| dy * dy).sum();
+        (total_sum_sq - self.residual_sum_sq()) / total_sum_sq
+    }
+
+    /// Returns the residual sum of squares, i.e. the sum of the squared residuals.
+    pub fn residual_sum_sq(&self) -> F {
+        self.residuals_response().mapv_into(|r| r * r).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        model::ModelBuilder, standardize::standardize, utility::one_pad, Linear, Logistic,
+        model::ModelBuilder,
+        utility::{one_pad, standardize},
+        Linear, Logistic,
     };
     use anyhow::Result;
     use approx::assert_abs_diff_eq;
@@ -546,6 +607,21 @@ mod tests {
         let pred_y = fit.expectation(&one_pad(data_x.view()), None);
         let target_dev = (data_y - pred_y).mapv(|dy| dy * dy).sum();
         assert_abs_diff_eq!(fit.deviance(), target_dev,);
+        Ok(())
+    }
+
+    // Check that the residuals for a linear model are all consistent.
+    #[test]
+    fn residuals_linear() -> Result<()> {
+        let data_y = array![0.1, -0.3, 0.7, 0.2, 1.2, -0.4];
+        let data_x = array![0.4, 0.1, 0.3, -0.1, 0.5, 0.6].insert_axis(Axis(1));
+        let model = ModelBuilder::<Linear>::data(&data_y, &data_x).build()?;
+        let fit = model.fit()?;
+        let response = fit.residuals_response();
+        let pearson = fit.residuals_pearson();
+        let deviance = fit.residuals_deviance();
+        assert_abs_diff_eq!(response, pearson);
+        assert_abs_diff_eq!(response, deviance);
         Ok(())
     }
 
