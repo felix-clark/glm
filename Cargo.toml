@@ -1,6 +1,6 @@
 [package]
 name = "ndarray-glm"
-version = "0.0.12"
+version = "0.0.13"
 authors = ["Felix Clark <mfclark3690@gmail.com>"]
 description = "Performs regression for generalized linear models using IRLS on data stored in arrays."
 edition = "2021"
@@ -24,7 +24,7 @@ intel-mkl-static = ["ndarray-linalg/intel-mkl-static"]
 intel-mkl-system = ["ndarray-linalg/intel-mkl-system"]
 
 [dependencies]
-itertools = "0.10"
+itertools = "0.12"
 ndarray = { version = "0.15", features = ["blas"] }
 ndarray-linalg = { version = "0.16" }
 num-traits = "0.2"
